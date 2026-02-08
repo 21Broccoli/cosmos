@@ -23,6 +23,8 @@ import os
 import pickle
 import random
 import time
+from pathlib import Path
+from typing import Optional, Sequence
 
 import cv2
 import h5py
@@ -162,6 +164,11 @@ class ALOHADataset(Dataset):
         load_all_rollouts_into_ram: bool = False,
         use_third_person_images: bool = True,
         use_wrist_images: bool = True,
+        action_flow_root: str | os.PathLike | None = None,
+        action_flow_camera: str = "head_camera",
+        action_flow_arms: Sequence[str] = ("left", "right"),
+        action_flow_dataset_root: str | os.PathLike | None = None,
+        action_flow_include_video_gt: bool = False,
     ):
         """
         Initialize ALOHA dataset for training.
@@ -399,6 +406,24 @@ class ALOHADataset(Dataset):
         self.rollout_data = {}  # In-memory rollout data storage; used if treat_demos_as_success_rollouts=True or load_all_rollouts_into_ram=True
         self.rollout_num_episodes = 0
         self.rollout_num_steps = 0
+
+        # Action flow configuration
+        if action_flow_root not in (None, "", []):
+            self.action_flow_enabled = True
+            self.action_flow_root = Path(action_flow_root).expanduser()
+            base_root = action_flow_dataset_root if action_flow_dataset_root else data_dir
+            self.action_flow_dataset_root = Path(base_root).expanduser()
+            self.action_flow_camera = str(action_flow_camera)
+            arms = tuple(str(arm) for arm in action_flow_arms if arm)
+            self.action_flow_arms = arms if arms else ("right",)
+            self.action_flow_include_video_gt = action_flow_include_video_gt
+        else:
+            self.action_flow_enabled = False
+            self.action_flow_root = None
+            self.action_flow_dataset_root = None
+            self.action_flow_camera = str(action_flow_camera)
+            self.action_flow_arms = tuple()
+            self.action_flow_include_video_gt = False
 
         # If treating demonstrations as success rollouts, add them to rollout data in-memory
         if self.treat_demos_as_success_rollouts:
@@ -679,6 +704,82 @@ class ALOHADataset(Dataset):
         if hasattr(self, "epoch_length") and self.epoch_length > 0:
             return self.epoch_length
         return self.num_steps
+
+    def _resolve_action_flow_path(self, episode_file_path: str, arm: str) -> Path | None:
+        if not self.action_flow_enabled:
+            return None
+        episode_path = Path(episode_file_path)
+        try:
+            rel = episode_path.relative_to(self.action_flow_dataset_root)
+        except ValueError:
+            return None
+        if len(rel.parts) == 0:
+            return None
+        task_name = rel.parts[0]
+        inner_parts = rel.parts[1:] if len(rel.parts) > 1 else (episode_path.name,)
+        inner_rel = Path(*inner_parts)
+        flow_dir = self.action_flow_root / task_name / f"arm_{arm}"
+        parent = inner_rel.parent if inner_rel.parent != Path(".") else Path()
+        flow_filename = f"{inner_rel.stem}_{self.action_flow_camera}_flow.npz"
+        return flow_dir / parent / flow_filename
+
+    def _load_action_flow_cache(self, episode_data: dict, arm: str):
+        cache_key = f"_action_flow_cache_{arm}"
+        if cache_key in episode_data:
+            return episode_data[cache_key]
+        flow_path = self._resolve_action_flow_path(episode_data["file_path"], arm)
+        if flow_path is None or not flow_path.exists():
+            episode_data[cache_key] = None
+            return None
+        with np.load(flow_path) as npz:
+            cache = {
+                "flow": npz["flow"],
+                "mask": npz["mask"] if "mask" in npz.files else None,
+                "video_flow": npz["video_flow"] if "video_flow" in npz.files else None,
+                "video_flow_mask": npz["video_flow_mask"] if "video_flow_mask" in npz.files else None,
+            }
+        episode_data[cache_key] = cache
+        return cache
+
+    def _get_action_flow_sample(self, episode_data: dict, step_idx: int):
+        if not self.action_flow_enabled or not self.action_flow_arms:
+            return None, None, None, None
+        flow_components: list[np.ndarray] = []
+        mask_components: list[np.ndarray] = []
+        video_flow_components: list[np.ndarray] = []
+        video_mask_components: list[np.ndarray] = []
+        for arm in self.action_flow_arms:
+            cache = self._load_action_flow_cache(episode_data, arm)
+            if cache is None:
+                return None, None, None, None
+            flow_arr = cache["flow"]
+            idx = min(max(step_idx, 0), flow_arr.shape[0] - 1)
+            flow_components.append(flow_arr[idx])
+            mask_arr = cache.get("mask")
+            if mask_arr is not None:
+                mask_components.append(mask_arr[idx])
+            vflow_arr = cache.get("video_flow")
+            if vflow_arr is not None:
+                video_flow_components.append(vflow_arr[idx])
+                vmask_arr = cache.get("video_flow_mask")
+                if vmask_arr is not None:
+                    video_mask_components.append(vmask_arr[idx])
+        if not flow_components:
+            return None, None, None, None
+        flow_tensor = torch.from_numpy(np.concatenate(flow_components, axis=0).copy()).float()
+        if mask_components:
+            mask_tensor = torch.from_numpy(np.concatenate(mask_components, axis=0).copy()).float()
+        else:
+            mask_tensor = torch.ones_like(flow_tensor)
+        video_flow_tensor = None
+        video_flow_mask_tensor = None
+        if video_flow_components:
+            video_flow_tensor = torch.from_numpy(np.concatenate(video_flow_components, axis=0).copy()).float()
+            if video_mask_components:
+                video_flow_mask_tensor = torch.from_numpy(np.concatenate(video_mask_components, axis=0).copy()).float()
+            else:
+                video_flow_mask_tensor = torch.ones_like(video_flow_tensor)
+        return flow_tensor, mask_tensor, video_flow_tensor, video_flow_mask_tensor
 
     def __getitem__(self, idx):
         """
@@ -1044,6 +1145,25 @@ class ALOHADataset(Dataset):
             num_steps=episode_data["num_steps"],
         )
 
+        action_flow_tensor = None
+        action_flow_mask_tensor = None
+        video_flow_tensor = None
+        video_flow_mask_tensor = None
+        if self.action_flow_enabled:
+            (
+                action_flow_tensor,
+                action_flow_mask_tensor,
+                video_flow_tensor,
+                video_flow_mask_tensor,
+            ) = self._get_action_flow_sample(
+                episode_data, relative_step_idx
+            )
+            if self.action_flow_include_video_gt and video_flow_tensor is None and action_flow_tensor is not None:
+                video_flow_tensor = action_flow_tensor.clone()
+                video_flow_mask_tensor = (
+                    action_flow_mask_tensor.clone() if action_flow_mask_tensor is not None else None
+                )
+
         t_prev = time.time()
 
         # Get return for value function prediction
@@ -1088,7 +1208,7 @@ class ALOHADataset(Dataset):
 
         t_now = time.time()
 
-        return {
+        sample_dict = {
             "video": all_images,
             "command": episode_data["command"],
             "actions": action_chunk,
@@ -1121,6 +1241,21 @@ class ALOHADataset(Dataset):
             "future_wrist_image2_latent_idx": future_wrist_image2_latent_idx,
             "future_image_latent_idx": future_image_latent_idx,
         }
+        if action_flow_tensor is not None:
+            sample_dict["action_flow"] = action_flow_tensor
+            sample_dict["action_flow_mask"] = (
+                action_flow_mask_tensor
+                if action_flow_mask_tensor is not None
+                else torch.ones_like(action_flow_tensor)
+            )
+        if video_flow_tensor is not None:
+            sample_dict["video_flow_gt"] = video_flow_tensor
+            sample_dict["video_flow_mask"] = (
+                video_flow_mask_tensor
+                if video_flow_mask_tensor is not None
+                else torch.ones_like(video_flow_tensor[:1])
+            )
+        return sample_dict
 
     def _load_rollout_episode_data(self, episode_metadata):
         """Load rollout episode data from HDF5 file using metadata (raw or MP4). Applies normalization if enabled."""

@@ -18,6 +18,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.amp as amp
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 
 from cosmos_policy._src.imaginaire.utils import log
@@ -44,6 +45,44 @@ class Mlp(nn.Module):
         return x
 
 
+class FlowAlignmentHead(nn.Module):
+    def __init__(self, flow_channels: int, hidden_dim: int, num_heads: int):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Conv2d(flow_channels, hidden_dim, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1),
+        )
+        self.query_norm = nn.LayerNorm(hidden_dim)
+        self.key_norm = nn.LayerNorm(hidden_dim)
+        self.attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.gate = nn.Parameter(torch.zeros(1))
+
+    def forward(
+        self,
+        action_tokens_B_H_W_D: torch.Tensor,
+        flow_B_C_H_W: torch.Tensor,
+        mask_B_C_H_W: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        B, H, W, D = action_tokens_B_H_W_D.shape
+        query = self.query_norm(action_tokens_B_H_W_D.view(B, H * W, D))
+        key_tokens = self.proj(flow_B_C_H_W).view(B, D, H * W).transpose(1, 2)
+        key_tokens = self.key_norm(key_tokens)
+        key_padding_mask = None
+        if mask_B_C_H_W is not None:
+            resized_mask = mask_B_C_H_W
+            if resized_mask.dim() == 3:
+                resized_mask = resized_mask.unsqueeze(1)
+            resized_mask = resized_mask.mean(dim=1, keepdim=True)
+            resized_mask = resized_mask.view(B, 1, H * W)
+            key_padding_mask = resized_mask.squeeze(1) <= 0.0
+        attn_out, _ = self.attn(query, key_tokens, key_tokens, key_padding_mask=key_padding_mask)
+        attn_out = self.out_proj(attn_out)
+        attn_out = attn_out.view(B, H, W, D)
+        return torch.tanh(self.gate) * attn_out
+
+
 class ActionConditionedMinimalV1LVGDiT(MiniTrainDIT):
     def __init__(self, *args, timestep_scale: float = 1.0, **kwargs):
         assert "in_channels" in kwargs, "in_channels must be provided"
@@ -62,6 +101,10 @@ class ActionConditionedMinimalV1LVGDiT(MiniTrainDIT):
         self.timestep_scale = timestep_scale
         log.info(f"timestep_scale: {timestep_scale}")
 
+        self.enable_flow_alignment_head = kwargs.pop("enable_flow_alignment_head", False)
+        self.flow_alignment_channels = kwargs.pop("flow_alignment_channels", 0)
+        self.flow_alignment_num_heads = kwargs.pop("flow_alignment_num_heads", kwargs.get("num_heads", 16))
+
         super().__init__(*args, **kwargs)
 
         # add action embedding
@@ -79,6 +122,14 @@ class ActionConditionedMinimalV1LVGDiT(MiniTrainDIT):
             act_layer=lambda: nn.GELU(approximate="tanh"),
             drop=0,
         )
+        if self.enable_flow_alignment_head and self.flow_alignment_channels > 0:
+            self.flow_alignment_head = FlowAlignmentHead(
+                flow_channels=self.flow_alignment_channels,
+                hidden_dim=self.model_channels,
+                num_heads=self.flow_alignment_num_heads,
+            )
+        else:
+            self.flow_alignment_head = None
 
     def forward(
         self,
@@ -92,6 +143,9 @@ class ActionConditionedMinimalV1LVGDiT(MiniTrainDIT):
         img_context_emb: Optional[torch.Tensor] = None,
         action: Optional[torch.Tensor] = None,
         intermediate_feature_ids: Optional[List[int]] = None,
+        action_flow_context_B_C_H_W: Optional[torch.Tensor] = None,
+        action_flow_mask_context_B_C_H_W: Optional[torch.Tensor] = None,
+        action_latent_indices: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
         del kwargs
@@ -132,6 +186,18 @@ class ActionConditionedMinimalV1LVGDiT(MiniTrainDIT):
             context_input = (crossattn_emb, img_context_emb)
         else:
             context_input = crossattn_emb
+
+        if (
+            self.flow_alignment_head is not None
+            and action_flow_context_B_C_H_W is not None
+            and action_latent_indices is not None
+        ):
+            x_B_T_H_W_D = self._apply_flow_alignment(
+                x_B_T_H_W_D,
+                action_flow_context_B_C_H_W,
+                action_flow_mask_context_B_C_H_W,
+                action_latent_indices,
+            )
 
         with amp.autocast("cuda", enabled=self.use_wan_fp32_strategy, dtype=torch.float32):
             if timesteps_B_T.ndim == 1:
@@ -184,6 +250,47 @@ class ActionConditionedMinimalV1LVGDiT(MiniTrainDIT):
             return x_B_C_Tt_Hp_Wp, intermediate_features_outputs
 
         return x_B_C_Tt_Hp_Wp
+
+    def _apply_flow_alignment(
+        self,
+        x_B_T_H_W_D: torch.Tensor,
+        flow_context: torch.Tensor,
+        flow_mask: Optional[torch.Tensor],
+        action_latent_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_indices = torch.arange(x_B_T_H_W_D.shape[0], device=x_B_T_H_W_D.device)
+        action_latent_indices = action_latent_indices.to(dtype=torch.long, device=x_B_T_H_W_D.device)
+        action_tokens = x_B_T_H_W_D[batch_indices, action_latent_indices]  # (B, H, W, D)
+        flow = flow_context.to(device=x_B_T_H_W_D.device, dtype=x_B_T_H_W_D.dtype)
+        mask = flow_mask.to(device=x_B_T_H_W_D.device, dtype=x_B_T_H_W_D.dtype) if flow_mask is not None else None
+        target_hw = (action_tokens.shape[1], action_tokens.shape[2])
+        flow = self._resize_flow_tensor(flow, target_hw, mode="bilinear")
+        if mask is not None:
+            mask = self._resize_flow_tensor(mask, target_hw, mode="nearest")
+        aligned = self.flow_alignment_head(action_tokens, flow, mask)
+        x_B_T_H_W_D[batch_indices, action_latent_indices, :, :, :] = action_tokens + aligned
+        return x_B_T_H_W_D
+
+    @staticmethod
+    def _resize_flow_tensor(tensor: torch.Tensor, target_hw: Tuple[int, int], mode: str) -> torch.Tensor:
+        if tensor.dim() == 3:
+            tensor = tensor.unsqueeze(0)
+        if tensor.shape[-2:] != target_hw:
+            tensor = F.interpolate(tensor, size=target_hw, mode=mode, align_corners=False if mode == "bilinear" else None)
+        return tensor
+
+    def configure_flow_alignment(self, enabled: bool, channels: int, num_heads: int):
+        self.enable_flow_alignment_head = enabled
+        self.flow_alignment_channels = channels
+        self.flow_alignment_num_heads = num_heads
+        if enabled and channels > 0:
+            self.flow_alignment_head = FlowAlignmentHead(
+                flow_channels=channels,
+                hidden_dim=self.model_channels,
+                num_heads=num_heads,
+            )
+        else:
+            self.flow_alignment_head = None
 
 
 class ActionChunkConditionedMinimalV1LVGDiT(MiniTrainDIT):

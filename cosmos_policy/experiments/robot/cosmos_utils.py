@@ -1041,6 +1041,28 @@ def get_action(
             proprio_tensor = (
                 torch.from_numpy(proprio).reshape(batch_size, -1).to(dtype=torch.bfloat16).cuda()
             )  # (B, proprio_dim)
+        placeholder_action_flow = None
+        placeholder_action_flow_mask = None
+        if model.config.use_action_flow and model.config.action_flow_channels > 0:
+            latent_h, latent_w = model.get_video_latent_height_width()
+            placeholder_action_flow = torch.zeros(
+                batch_size,
+                model.config.action_flow_channels,
+                latent_h,
+                latent_w,
+                dtype=torch.bfloat16,
+            ).cuda()
+            mask_channels = (
+                model.config.action_flow_mask_channels if model.config.action_flow_mask_channels > 0 else 1
+            )
+            placeholder_action_flow_mask = torch.ones(
+                batch_size,
+                mask_channels,
+                latent_h,
+                latent_w,
+                dtype=torch.bfloat16,
+            ).cuda()
+
         data_batch = {
             "dataset_name": "video_data",
             "video": raw_image_sequence,  # (B, C, T, H, W)
@@ -1106,6 +1128,8 @@ def get_action(
                 else torch.tensor([-1] * batch_size, dtype=torch.int64).cuda()
             ),
             "value_latent_idx": torch.tensor([value_latent_idx] * batch_size, dtype=torch.int64).cuda(),
+            "action_flow": placeholder_action_flow,
+            "action_flow_mask": placeholder_action_flow_mask,
         }
 
         # Generate the output latent sequence - contains the predicted action chunk, future state, and value, but
@@ -1124,14 +1148,12 @@ def get_action(
         action_indices = torch.full(
             (batch_size,), action_latent_idx, dtype=torch.int64, device=generated_latent_with_action.device
         )
-        actions = (
-            extract_action_chunk_from_latent_sequence(
-                generated_latent_with_action, action_shape=(cfg.chunk_size, ACTION_DIM), action_indices=action_indices
-            )
-            .to(torch.float32)
-            .cpu()
-            .numpy()
-        )
+        actions = model.decode_actions_from_latent(
+            generated_latent_with_action,
+            action_indices=action_indices,
+            action_shape=(cfg.chunk_size, ACTION_DIM),
+        ).to(torch.float32)
+        actions = actions.cpu().numpy()
 
         # Unnormalize actions back to original dataset scale
         if cfg.unnormalize_actions:

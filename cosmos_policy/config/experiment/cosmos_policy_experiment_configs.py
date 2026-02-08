@@ -301,6 +301,10 @@ aloha_cosmos_policy_dataset_185_demos = L(ALOHADataset)(
     success_rollout_sampling_prob=0.5,
     return_value_function_returns=True,
     gamma=0.998,  # Higher gamma for ALOHA because episodes can have up to 1.5-2.0K steps  # (s, a, s', v)
+    action_flow_root=os.environ.get("COSMOS_ACTION_FLOW_ROOT", None),
+    action_flow_dataset_root=os.environ.get("COSMOS_ACTION_FLOW_DATASET_ROOT", None),
+    action_flow_camera="head_camera",
+    action_flow_include_video_gt=True,
 )
 cosmos_predict2_2b_480p_aloha_185_demos_4_tasks_mixture_foldshirt15_candiesinbowl45_candyinbag45_eggplantchickenonplate80 = LazyDict(
     dict(
@@ -321,6 +325,15 @@ cosmos_predict2_2b_480p_aloha_185_demos_4_tasks_mixture_foldshirt15_candiesinbow
                 state_t=11,  # Latent temporal dim (blank, proprio, left wrist, right wrist, primary, action, future proprio, future left wrist, future right wrist, future primary, value)
                 min_num_conditional_frames=5,  # 1 blank, 4 conditioning (proprio, left wrist, right wrist, primary)
                 max_num_conditional_frames=5,  # 1 blank, 4 conditioning (proprio, left wrist, right wrist, primary)
+                use_action_flow=True,
+                action_flow_channels=4,
+                action_flow_mask_channels=4,
+                flow_matching_loss_weight=0.15,
+                flow_matching_loss_type="l2",
+                decode_actions_from_flow=True,
+                flow_action_loss_weight=0.1,
+                enable_flow_alignment_head=True,
+                flow_alignment_num_heads=8,
                 tokenizer=dict(
                     chunk_duration=41,  # 1 blank + 40 images (4 proprio, 4 left wrist image, 4 right wrist image, 4 primary image, 4 action, 4 future proprio, 4 future left wrist, 4 future right wrist, 4 future primary, 4 value)
                 ),

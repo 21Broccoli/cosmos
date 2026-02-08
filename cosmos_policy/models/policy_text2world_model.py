@@ -19,10 +19,12 @@ Cosmos Policy Diffusion Model - extends Text2WorldModel with policy-specific fun
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 import attrs
 import torch
+import torch.nn.functional as F
 from einops import rearrange
 
 from cosmos_policy._src.imaginaire.lazy_config import LazyCall as L
@@ -38,74 +40,143 @@ from cosmos_policy._src.predict2.models.text2world_model import (
     Text2WorldModelConfig as BaseText2WorldModelConfig,
 )
 from cosmos_policy.conditioner import Text2WorldCondition
+from cosmos_policy.modules import ActionFlowDecoder, compute_flow_matching_loss
 from cosmos_policy.modules.cosmos_sampler import CosmosPolicySampler
 from cosmos_policy.modules.hybrid_edm_sde import HybridEDMSDE
 
 
+def _reshape_vector_to_latent(
+    flat_action: torch.Tensor,
+    num_channels: int,
+    latent_h: int,
+    latent_w: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if num_channels <= 0:
+        return torch.zeros(flat_action.shape[0], 0, latent_h, latent_w, device=device, dtype=dtype)
+    latent_elements = num_channels * latent_h * latent_w
+    num_action_elements = flat_action.shape[1]
+    num_repeats = (latent_elements + num_action_elements - 1) // num_action_elements
+    repeated_action = flat_action.repeat(1, num_repeats)
+    trimmed = repeated_action[:, :latent_elements]
+    return trimmed.to(device=device, dtype=dtype).reshape(flat_action.shape[0], num_channels, latent_h, latent_w)
+
+
+@dataclass
+class ActionFlowInjectionInfo:
+    flow_channels: int = 0
+    mask_channels: int = 0
+    flow_latent: Optional[torch.Tensor] = None
+    mask_latent: Optional[torch.Tensor] = None
+
+
 def replace_latent_with_action_chunk(
-    x0: torch.Tensor, action_chunk: torch.Tensor, action_indices: torch.Tensor
+    x0: torch.Tensor,
+    action_chunk: torch.Tensor,
+    action_indices: torch.Tensor,
+    action_flow: Optional[torch.Tensor] = None,
+    action_flow_mask: Optional[torch.Tensor] = None,
+    max_flow_channels: Optional[int] = None,
+    max_flow_mask_channels: Optional[int] = None,
+    return_injection_info: bool = False,
 ) -> torch.Tensor:
     """
     Replaces the image latent (at the specified action index) in clean input image latents x0 with the action chunk.
 
-    Example:
-    Let's say x0 has shape (B=32, C'=16, T', H'=28, W'=28) and action_chunk has shape (B=32, chunk_size=8, action_dim=7).
-    Then, this function will overwrite the (C'=16, H'=28, W'=28) volume at x0[:,:,action_indices,:,:] with the action chunk,
-    repeating it as many times as needed to fill the entire volume.
-
-    Args:
-        x0 (torch.Tensor): Clean image latents.
-        action_chunk (torch.Tensor): Ground-truth action chunk.
-        action_indices (torch.Tensor): Batch indices of the image latents to replace.
-
-    Returns:
-        torch.Tensor: Modified image latents.
+    Supports injecting a spatial action flow tensor (and optional mask) into the same latent frame so that the
+    model learns to align actions with geometry, while any remaining channels still encode the original action vector.
     """
-    # Get latent to be replaced
     batch_indices = torch.arange(x0.shape[0], device=x0.device)
     action_image_latent = x0[batch_indices, :, action_indices, :, :]
-
-    # Create a new tensor with the same shape as action_image_latent, filled with zeros
-    result = torch.zeros_like(action_image_latent)
-
-    # Get shapes
     batch_size, latent_channels, latent_h, latent_w = action_image_latent.shape
 
-    # Flatten action_chunk (preserving batch dimension)
+    result = torch.zeros_like(action_image_latent)
+    injection_info = ActionFlowInjectionInfo() if return_injection_info else None
     flat_action = action_chunk.reshape(batch_size, -1)
-    num_action_elements = flat_action.shape[1]
+    next_channel = 0
 
-    # Calculate total elements in the target tensor (per batch)
-    latent_elements = latent_channels * latent_h * latent_w
+    if action_flow is not None:
+        flow = action_flow
+        if flow.dim() == 3:
+            flow = flow.unsqueeze(0)
+        if flow.shape[0] == 1 and batch_size > 1:
+            flow = flow.repeat(batch_size, 1, 1, 1)
+        flow = flow.to(device=action_image_latent.device, dtype=action_image_latent.dtype)
+        if flow.shape[2] != latent_h or flow.shape[3] != latent_w:
+            flow = F.interpolate(flow, size=(latent_h, latent_w), mode="bilinear", align_corners=False)
+        target_flow_channels = max_flow_channels if max_flow_channels is not None else flow.shape[1]
+        if flow.shape[1] < target_flow_channels:
+            pad = torch.zeros(
+                batch_size,
+                target_flow_channels - flow.shape[1],
+                latent_h,
+                latent_w,
+                device=flow.device,
+                dtype=flow.dtype,
+            )
+            flow = torch.cat([flow, pad], dim=1)
+        elif target_flow_channels is not None and flow.shape[1] > target_flow_channels:
+            flow = flow[:, :target_flow_channels, :, :]
+        flow_channels = min(latent_channels, flow.shape[1])
+        if flow_channels > 0:
+            flow_slice = flow[:, :flow_channels, :, :]
+            result[:, :flow_channels, :, :] = flow_slice
+            if injection_info is not None:
+                injection_info.flow_channels = flow_channels
+                injection_info.flow_latent = flow_slice.detach()
+            next_channel = flow_channels
+        if action_flow_mask is None and max_flow_mask_channels:
+            action_flow_mask = torch.ones(
+                batch_size,
+                max_flow_mask_channels,
+                latent_h,
+                latent_w,
+                device=action_image_latent.device,
+                dtype=action_image_latent.dtype,
+            )
+        if action_flow_mask is not None and next_channel < latent_channels:
+            mask = action_flow_mask
+            if mask.dim() == 3:
+                mask = mask.unsqueeze(0)
+            if mask.shape[0] == 1 and batch_size > 1:
+                mask = mask.repeat(batch_size, 1, 1, 1)
+            mask = mask.to(device=action_image_latent.device, dtype=action_image_latent.dtype)
+            if mask.shape[2] != latent_h or mask.shape[3] != latent_w:
+                mask = F.interpolate(mask, size=(latent_h, latent_w), mode="bilinear", align_corners=False)
+            target_mask_channels = max_flow_mask_channels if max_flow_mask_channels is not None else mask.shape[1]
+            if mask.shape[1] < target_mask_channels:
+                pad = torch.zeros(
+                    batch_size,
+                    target_mask_channels - mask.shape[1],
+                    latent_h,
+                    latent_w,
+                    device=mask.device,
+                    dtype=mask.dtype,
+                )
+                mask = torch.cat([mask, pad], dim=1)
+            elif target_mask_channels is not None and mask.shape[1] > target_mask_channels:
+                mask = mask[:, :target_mask_channels, :, :]
+            mask_channels = min(latent_channels - next_channel, mask.shape[1])
+            if mask_channels > 0:
+                mask_slice = mask[:, :mask_channels, :, :]
+                result[:, next_channel : next_channel + mask_channels, :, :] = mask_slice
+                if injection_info is not None:
+                    injection_info.mask_channels = mask_channels
+                    injection_info.mask_latent = mask_slice.detach()
+                next_channel += mask_channels
 
-    # Check that there is enough room in the target tensor for all the action elements
-    assert num_action_elements <= latent_elements, (
-        f"Not enough room in the latent tensor for the full action chunk: {num_action_elements} action elements > {latent_elements} latent elements!"
-    )
+    remaining_channels = latent_channels - next_channel
+    if remaining_channels > 0:
+        vector_latent = _reshape_vector_to_latent(
+            flat_action, remaining_channels, latent_h, latent_w, action_image_latent.device, action_image_latent.dtype
+        )
+        result[:, next_channel:, :, :] = vector_latent
 
-    # Calculate how many times we need to repeat the action tensor
-    # The expression below is a concise way of doing ceiling division to get the correct number of repeats
-    num_repeats = (latent_elements + num_action_elements - 1) // num_action_elements
-
-    # Repeat the action tensor along dimension 1
-    repeated_action = flat_action.repeat(1, num_repeats)
-
-    # Take only what we need to fill the result tensor
-    repeated_action = repeated_action[:, :latent_elements]
-
-    # Reshape the target tensor to put all channel and spatial dimensions together
-    flat_result = result.reshape(batch_size, -1)
-
-    # Place the action chunk values into the beginning of the flattened result
-    flat_result[:, :] = repeated_action
-
-    # Reshape back to original shape
-    result = flat_result.reshape(batch_size, latent_channels, latent_h, latent_w)
-
-    # Get final latents tensor
     new_x0 = x0
     new_x0[batch_indices, :, action_indices, :, :] = result
-
+    if injection_info is not None:
+        return new_x0, injection_info
     return new_x0
 
 
@@ -207,6 +278,16 @@ class CosmosPolicyModelConfig(BaseText2WorldModelConfig):
     # Action loss multiplier (if greater than 1, upweights loss on predicting actions relative to other losses)
     # (Must be an integer - or will be cast to an integer later!)
     action_loss_multiplier: int = 1
+    use_action_flow: bool = False
+    action_flow_channels: int = 0
+    action_flow_mask_channels: int = 0
+    enable_flow_alignment_head: bool = False
+    flow_alignment_num_heads: int = 4
+    flow_matching_loss_weight: float = 0.0
+    flow_matching_loss_type: str = "l2"
+    decode_actions_from_flow: bool = False
+    flow_action_loss_weight: float = 0.0
+    flow_decoder: Optional[LazyDict] = None
 
     def __attrs_post_init__(self):
         super().__attrs_post_init__()
@@ -236,6 +317,25 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
         # Cosmos Policy SDE and Sampler
         self.sde = lazy_instantiate(config.sde)
         self.sampler = CosmosPolicySampler()
+        if hasattr(self.net, "configure_flow_alignment"):
+            self.net.configure_flow_alignment(
+                enabled=self.config.enable_flow_alignment_head,
+                channels=self.config.action_flow_channels,
+                num_heads=self.config.flow_alignment_num_heads,
+            )
+        self.flow_decoder: Optional[ActionFlowDecoder] = None
+        if self.config.use_action_flow and (
+            self.config.decode_actions_from_flow or self.config.flow_action_loss_weight > 0
+        ):
+            if self.config.action_flow_channels <= 0:
+                raise ValueError("action_flow_channels must be > 0 when enabling flow decoding/losses.")
+            if self.config.flow_decoder is not None:
+                self.flow_decoder = lazy_instantiate(self.config.flow_decoder)
+            else:
+                self.flow_decoder = ActionFlowDecoder(
+                    in_channels=self.config.action_flow_channels,
+                    hidden_dim=self.net.model_channels if hasattr(self, "net") else self.config.state_ch * 8,
+                )
 
     def training_step(
         self, data_batch: dict[str, torch.Tensor], iteration: int
@@ -296,6 +396,10 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
             value_function_sample_mask=data_batch["value_function_sample_mask"],
             value_function_return=data_batch["value_function_return"],
             value_indices=data_batch["value_latent_idx"],
+            action_flow=data_batch.get("action_flow"),
+            action_flow_mask=data_batch.get("action_flow_mask"),
+            video_flow_gt=data_batch.get("video_flow_gt"),
+            video_flow_mask=data_batch.get("video_flow_mask"),
         )
 
         if self.loss_reduce == "mean":
@@ -304,6 +408,7 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
             kendall_loss = kendall_loss.sum(dim=1).mean() * self.loss_scale
         else:
             raise ValueError(f"Invalid loss_reduce: {self.loss_reduce}")
+
 
         return output_batch, kendall_loss
 
@@ -328,6 +433,10 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
         value_function_sample_mask: torch.Tensor,
         value_function_return: torch.Tensor,
         value_indices: torch.Tensor,
+        action_flow: Optional[torch.Tensor] = None,
+        action_flow_mask: Optional[torch.Tensor] = None,
+        video_flow_gt: Optional[torch.Tensor] = None,
+        video_flow_mask: Optional[torch.Tensor] = None,
     ):
         """
         NOTE (user): Modified to add action chunk prediction and future image prediction + action chunk loss logging.
@@ -359,6 +468,10 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
             value_function_sample_mask: mask for value function samples
             value_function_return: ground truth value function returns
             value_indices: indices for value latent frames
+            action_flow: optional spatial action flow tensor aligned with the action latent frame
+            action_flow_mask: optional mask highlighting valid flow regions
+            video_flow_gt: optional video-derived flow tensor used as target for flow matching
+            video_flow_mask: optional weighting mask aligned with video_flow_gt
 
         Returns:
             tuple: A tuple containing four elements:
@@ -377,11 +490,41 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
         condition.orig_x0_B_C_T_H_W = x0_B_C_T_H_W.clone()  # Keep a backup of the original gt_frames
         batch_indices = torch.arange(x0_B_C_T_H_W.shape[0], device=x0_B_C_T_H_W.device)
         C_latent, H_latent, W_latent = x0_B_C_T_H_W.shape[1], x0_B_C_T_H_W.shape[3], x0_B_C_T_H_W.shape[4]
-        # Action
-        x0_B_C_T_H_W = replace_latent_with_action_chunk(
+
+        def _resize_spatial_tensor(
+            tensor: Optional[torch.Tensor],
+            channels_limit: Optional[int] = None,
+            mode: str = "bilinear",
+        ) -> Optional[torch.Tensor]:
+            if tensor is None:
+                return None
+            if tensor.dim() == 3:
+                tensor = tensor.unsqueeze(0)
+            if tensor.shape[0] not in (1, x0_B_C_T_H_W.shape[0]):
+                raise ValueError(
+                    f"Flow tensor batch dimension {tensor.shape[0]} incompatible with batch size {x0_B_C_T_H_W.shape[0]}"
+                )
+            if tensor.shape[0] == 1 and x0_B_C_T_H_W.shape[0] > 1:
+                tensor = tensor.repeat(x0_B_C_T_H_W.shape[0], 1, 1, 1)
+            tensor = tensor.to(device=x0_B_C_T_H_W.device, dtype=x0_B_C_T_H_W.dtype)
+            if channels_limit is not None:
+                tensor = tensor[:, :channels_limit, :, :]
+            if tensor.shape[2] != H_latent or tensor.shape[3] != W_latent:
+                interp_kwargs = {"align_corners": False} if mode in {"linear", "bilinear", "bicubic", "trilinear"} else {}
+                tensor = F.interpolate(tensor, size=(H_latent, W_latent), mode=mode, **interp_kwargs)
+            return tensor
+        # Action (optionally with spatial flow channels)
+        action_flow_tensor = action_flow if self.config.use_action_flow else None
+        action_flow_mask_tensor = action_flow_mask if self.config.use_action_flow else None
+        x0_B_C_T_H_W, action_flow_info = replace_latent_with_action_chunk(
             x0_B_C_T_H_W,
             action_chunk,
             action_indices=action_indices,
+            action_flow=action_flow_tensor,
+            action_flow_mask=action_flow_mask_tensor,
+            max_flow_channels=self.config.action_flow_channels if self.config.use_action_flow else None,
+            max_flow_mask_channels=self.config.action_flow_mask_channels if self.config.use_action_flow else None,
+            return_injection_info=True,
         )
         # Proprio
         if torch.all(current_proprio_indices != -1):  # -1 indicates proprio is not used
@@ -410,6 +553,60 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
         model_pred = self.denoise(xt_B_C_T_H_W, sigma_B_T, condition)
         # loss weights for different noise levels
         weights_per_sigma_B_T = self.get_per_sigma_loss_weights(sigma=sigma_B_T)
+
+        flow_matching_loss = None
+        flow_action_loss = None
+        if (
+            self.config.flow_matching_loss_weight > 0
+            and self.config.use_action_flow
+            and action_flow_info.flow_channels > 0
+            and video_flow_gt is not None
+        ):
+            video_flow_latent = _resize_spatial_tensor(video_flow_gt, channels_limit=action_flow_info.flow_channels)
+            mask_tensor = action_flow_info.mask_latent
+            if mask_tensor is None and video_flow_mask is not None:
+                mask_tensor = _resize_spatial_tensor(video_flow_mask, channels_limit=None, mode="nearest")
+            action_indices_clamped = torch.clamp(action_indices, 0, x0_B_C_T_H_W.shape[2] - 1)
+            pred_flow = model_pred.x0[
+                batch_indices,
+                : action_flow_info.flow_channels,
+                action_indices_clamped,
+                :,
+                :,
+            ]
+            flow_matching_loss = compute_flow_matching_loss(
+                video_flow_latent,
+                pred_flow,
+                mask=mask_tensor,
+                loss_type=self.config.flow_matching_loss_type,
+            )
+            kendall_loss = kendall_loss + self.config.flow_matching_loss_weight * flow_matching_loss
+
+        if (
+            self.flow_decoder is not None
+            and self.config.flow_action_loss_weight > 0
+            and action_flow_info.flow_channels >= self.config.action_flow_channels > 0
+        ):
+            chunk_size = action_chunk.shape[1]
+            action_dim = action_chunk.shape[2]
+            pred_flow = model_pred.x0[
+                batch_indices,
+                : self.config.action_flow_channels,
+                action_indices,
+                :,
+                :,
+            ]
+            mask_slice = None
+            if self.config.action_flow_mask_channels > 0 and action_flow_info.mask_latent is not None:
+                mask_slice = action_flow_info.mask_latent[:, : self.config.action_flow_mask_channels, :, :]
+            flow_action_pred = self.flow_decoder(
+                pred_flow,
+                chunk_size=chunk_size,
+                action_dim=action_dim,
+                mask=mask_slice,
+            )
+            flow_action_loss = F.mse_loss(flow_action_pred, action_chunk.to(flow_action_pred.dtype))
+            kendall_loss = kendall_loss + self.config.flow_action_loss_weight * flow_action_loss
 
         # Construct mask to support masking out loss (or scaling it by some multiplier) for different types of predictions
         B, T = x0_B_C_T_H_W.shape[0], x0_B_C_T_H_W.shape[2]
@@ -673,6 +870,19 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
             "mse_loss": pred_mse_B_C_T_H_W.mean(),
             "edm_loss": edm_loss_B_C_T_H_W.mean(),
             "edm_loss_per_frame": torch.mean(edm_loss_B_C_T_H_W, dim=[1, 3, 4]),
+            "flow_matching_loss": (
+                flow_matching_loss.detach()
+                if flow_matching_loss is not None
+                else torch.zeros(1, device=x0_B_C_T_H_W.device, dtype=x0_B_C_T_H_W.dtype)
+            ),
+            "flow_matching_weight": self.config.flow_matching_loss_weight,
+            "flow_action_loss": (
+                flow_action_loss.detach()
+                if flow_action_loss is not None
+                else torch.zeros(1, device=x0_B_C_T_H_W.device, dtype=x0_B_C_T_H_W.dtype)
+            ),
+            "flow_action_weight": self.config.flow_action_loss_weight,
+            "action_flow_channels": action_flow_info.flow_channels,
             # Demo sample losses
             "demo_sample_action_mse_loss": demo_sample_action_mse_loss,  # Main action loss for policy
             "demo_sample_action_l1_loss": demo_sample_action_l1_loss,  # Main action loss for policy
@@ -698,6 +908,61 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
             "value_function_sample_value_l1_loss": value_function_sample_value_l1_loss,  # Main loss for value function
         }
         return output_batch, kendall_loss, pred_mse_B_C_T_H_W, edm_loss_B_C_T_H_W
+
+    def decode_actions_from_latent(
+        self,
+        latent_sequence: torch.Tensor,
+        action_indices: torch.Tensor,
+        action_shape: tuple[int, int],
+    ) -> torch.Tensor:
+        if (
+            self.config.use_action_flow
+            and self.config.decode_actions_from_flow
+            and self.flow_decoder is not None
+            and self.config.action_flow_channels > 0
+        ):
+            flow = self._slice_action_flow_from_latent(latent_sequence, action_indices, self.config.action_flow_channels)
+            mask = None
+            if self.config.action_flow_mask_channels > 0:
+                mask = self._slice_action_flow_from_latent(
+                    latent_sequence,
+                    action_indices,
+                    self.config.action_flow_mask_channels,
+                    channel_offset=self.config.action_flow_channels,
+                )
+            return self.flow_decoder(
+                flow,
+                chunk_size=action_shape[0],
+                action_dim=action_shape[1],
+                mask=mask,
+            )
+        return self._default_action_decode(latent_sequence, action_indices, action_shape)
+
+    def _slice_action_flow_from_latent(
+        self,
+        latent_sequence: torch.Tensor,
+        action_indices: torch.Tensor,
+        num_channels: int,
+        channel_offset: int = 0,
+    ) -> torch.Tensor:
+        batch_indices = torch.arange(latent_sequence.shape[0], device=latent_sequence.device)
+        start = channel_offset
+        end = channel_offset + num_channels
+        return latent_sequence[batch_indices, start:end, action_indices, :, :]
+
+    def _default_action_decode(
+        self,
+        latent_sequence: torch.Tensor,
+        action_indices: torch.Tensor,
+        action_shape: tuple[int, int],
+    ) -> torch.Tensor:
+        batch_indices = torch.arange(latent_sequence.shape[0], device=latent_sequence.device)
+        action_frame = latent_sequence[batch_indices, :, action_indices, :, :]
+        flat = action_frame.reshape(action_frame.shape[0], -1)
+        chunk = action_shape[0] * action_shape[1]
+        chunks = flat[:, : (flat.shape[1] // chunk) * chunk].reshape(flat.shape[0], -1, chunk)
+        chunks = chunks.reshape(flat.shape[0], -1, action_shape[0], action_shape[1])
+        return chunks.mean(dim=1)
 
     def generate_samples_from_batch(
         self,

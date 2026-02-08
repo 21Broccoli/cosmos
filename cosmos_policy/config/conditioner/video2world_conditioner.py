@@ -53,6 +53,9 @@ class Video2WorldCondition(Text2WorldCondition):
     # the following two attributes are used to set the video condition; during training, inference
     gt_frames: Optional[torch.Tensor] = None
     condition_video_input_mask_B_C_T_H_W: Optional[torch.Tensor] = None
+    action_flow_context_B_C_H_W: Optional[torch.Tensor] = None
+    action_flow_mask_context_B_C_H_W: Optional[torch.Tensor] = None
+    action_latent_indices: Optional[torch.Tensor] = None
 
     def set_video_condition(
         self,
