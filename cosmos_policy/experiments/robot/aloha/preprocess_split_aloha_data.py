@@ -77,6 +77,7 @@ Usage examples:
 
 import argparse
 import glob
+import io
 import json
 import os
 import random
@@ -158,14 +159,48 @@ def load_hdf5(demo_path):
 
     print(f"Loading {demo_path}...")
     with h5py.File(demo_path, "r") as root:
-        is_sim = root.attrs["sim"]
-        qpos = root["/observations/qpos"][()]
-        qvel = root["/observations/qvel"][()]
-        effort = root["/observations/effort"][()]
-        action = root["/action"][()]
-        image_dict = dict()
-        for cam_name in root["/observations/images/"].keys():
-            image_dict[cam_name] = root[f"/observations/images/{cam_name}"][()]
+        # Agilex-style recordings may omit the "sim" attribute; assume False if absent.
+        is_sim = bool(root.attrs.get("sim", False))
+        if "/observations/qpos" in root:
+            qpos = root["/observations/qpos"][()]
+            qvel = root["/observations/qvel"][()]
+            effort = root["/observations/effort"][()]
+            action = root["/action"][()]
+            image_dict = {cam: root[f"/observations/images/{cam}"][()] for cam in root["/observations/images/"].keys()}
+        else:
+            # Handle ALOHA Agilex-style episodes.
+            action = np.asarray(root["joint_action/vector"][()])
+            qpos = action.copy()
+            if qpos.ndim == 1:
+                qpos = qpos[None, :]
+            qvel = np.zeros_like(qpos)
+            if len(qpos) > 1:
+                qvel[1:] = qpos[1:] - qpos[:-1]
+            effort = np.zeros_like(qpos)
+
+            cam_map = {
+                "cam_high": "head_camera",
+                "cam_left_wrist": "left_camera",
+                "cam_right_wrist": "right_camera",
+            }
+            image_dict = {}
+            obs_group = root.get("observation", {})
+            for target_name, source_name in cam_map.items():
+                if source_name not in obs_group:
+                    continue
+                rgb_dataset = obs_group[source_name]["rgb"]
+                frames = []
+                for raw_frame in rgb_dataset:
+                    if isinstance(raw_frame, np.ndarray):
+                        frame_bytes = raw_frame.tobytes()
+                    else:
+                        frame_bytes = bytes(raw_frame)
+                    with Image.open(io.BytesIO(frame_bytes)) as img:
+                        frames.append(np.array(img.convert("RGB")))
+                if frames:
+                    image_dict[target_name] = np.stack(frames)
+            if not image_dict:
+                raise KeyError("No RGB observations found for Agilex-format episode.")
     print(f"Loading episode complete: {demo_path}")
 
     return qpos, qvel, effort, action, image_dict, is_sim

@@ -3,11 +3,22 @@ import io
 import math
 from pathlib import Path
 
+import cv2
 import h5py
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
-import cv2
+
+CONTACT_OFFSETS = np.array(
+    [
+        [0.0, 0.0, 0.0],
+        [0.03, 0.0, 0.0],
+        [-0.03, 0.0, 0.0],
+        [0.0, 0.03, 0.0],
+        [0.0, -0.03, 0.0],
+    ],
+    dtype=np.float32,
+)
 
 
 def _load_image_size(rgb_dataset):
@@ -22,7 +33,7 @@ def _load_image_size(rgb_dataset):
 
 
 def _project_point(intrinsic, extrinsic, point_world):
-    point_h = np.concatenate([point_world, [1.0]], axis=0)
+    point_h = np.concatenate([point_world, [1.0]], axis=0).astype(np.float64)
     cam = extrinsic @ point_h
     if cam[2] <= 1e-6:
         return None
@@ -30,6 +41,46 @@ def _project_point(intrinsic, extrinsic, point_world):
     u = pix[0] / pix[2]
     v = pix[1] / pix[2]
     return float(u), float(v)
+
+
+def _quat_to_matrix(quat: np.ndarray) -> np.ndarray:
+    q = np.asarray(quat, dtype=np.float64)
+    if q.shape[0] != 4:
+        raise ValueError("Quaternion must contain 4 scalars.")
+    norm = np.linalg.norm(q)
+    if norm < 1e-8:
+        return np.eye(3, dtype=np.float64)
+    q = q / norm
+    x, y, z, w = q
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+    rot = np.array(
+        [
+            [1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy)],
+            [2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx)],
+            [2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy)],
+        ],
+        dtype=np.float64,
+    )
+    return rot
+
+
+def _pose_vec_to_matrix(pose_vec: np.ndarray) -> np.ndarray:
+    pose_vec = np.asarray(pose_vec)
+    if pose_vec.shape[-1] == 7:
+        pos = pose_vec[:3]
+        quat = pose_vec[3:7]
+        mat = np.eye(4, dtype=np.float64)
+        mat[:3, :3] = _quat_to_matrix(quat)
+        mat[:3, 3] = pos
+        return mat
+    if pose_vec.shape[-1] == 16:
+        return pose_vec.reshape(4, 4)
+    # Fallback: treat as pure translation
+    mat = np.eye(4, dtype=np.float64)
+    mat[:3, 3] = pose_vec[:3]
+    return mat
 
 
 def _rasterize(flow_tensor, mask_tensor, u, v, du, dv, width, height, resolution, sigma=1.0):
@@ -66,6 +117,30 @@ def _decode_rgb_frame(dataset, index):
         data = bytes(raw)
     with Image.open(io.BytesIO(data)) as img:
         return np.array(img.convert("RGB"))
+
+
+def _write_debug_flow_visualization(
+    rgb_dataset,
+    frame_idx: int,
+    start_uv: tuple[float, float],
+    end_uv: tuple[float, float],
+    out_dir: Path,
+    rel_episode: Path,
+    arm: str,
+    camera: str,
+):
+    if out_dir is None:
+        return
+    frame = _decode_rgb_frame(rgb_dataset, frame_idx)
+    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    start_pt = (int(round(start_uv[0])), int(round(start_uv[1])))
+    end_pt = (int(round(end_uv[0])), int(round(end_uv[1])))
+    cv2.circle(frame_bgr, start_pt, 4, (0, 0, 255), -1)
+    cv2.arrowedLine(frame_bgr, start_pt, end_pt, (0, 255, 0), 2, tipLength=0.25)
+    rel_dir = out_dir / rel_episode.parent
+    rel_dir.mkdir(parents=True, exist_ok=True)
+    file_name = f"{rel_episode.stem}_arm-{arm}_{camera}_t{frame_idx}.jpg"
+    cv2.imwrite(str(rel_dir / file_name), frame_bgr)
 
 
 def _compute_optical_flow_sequence(frames, resolution):
@@ -107,6 +182,8 @@ def process_episode(
     sigma: float,
     compute_video_flow: bool = False,
     video_flow_resolution: int | None = None,
+    debug_viz_dir: Path | None = None,
+    relative_episode_path: Path | None = None,
 ):
     with h5py.File(episode_path, "r") as f:
         if "observation" not in f or camera not in f["observation"]:
@@ -121,8 +198,8 @@ def process_episode(
         pose_key = f"{arm}_endpose"
         if pose_key not in f["endpose"]:
             return False, f"Missing endpose/{pose_key} in {episode_path}"
-        endpose = f["endpose"][pose_key][:, :3]
-        num_steps = endpose.shape[0]
+        endpose_dataset = f["endpose"][pose_key][:]
+        num_steps = endpose_dataset.shape[0]
         flow = np.zeros((num_steps, 2, resolution, resolution), dtype=np.float32)
         mask = np.zeros((num_steps, 1, resolution, resolution), dtype=np.float32)
         video_flow = None
@@ -131,18 +208,44 @@ def process_episode(
             frames = [_decode_rgb_frame(rgb, idx) for idx in range(num_steps)]
             vf_res = video_flow_resolution if video_flow_resolution is not None else resolution
             video_flow, video_flow_mask = _compute_optical_flow_sequence(frames, vf_res)
+        pose_matrices = []
+        for t in range(num_steps):
+            pose_matrices.append(_pose_vec_to_matrix(endpose_dataset[t]))
+        pose_matrices = np.stack(pose_matrices, axis=0)
         for t in range(num_steps - 1):
             intrinsic_t = intrinsics[t]
             extrinsic_t = extrinsics[t]
             intrinsic_t1 = intrinsics[t + 1]
             extrinsic_t1 = extrinsics[t + 1]
-            uv0 = _project_point(intrinsic_t, extrinsic_t, endpose[t])
-            uv1 = _project_point(intrinsic_t1, extrinsic_t1, endpose[t + 1])
-            if uv0 is None or uv1 is None:
-                continue
-            du = uv1[0] - uv0[0]
-            dv = uv1[1] - uv0[1]
-            _rasterize(flow[t], mask[t], uv0[0], uv0[1], du, dv, width, height, resolution, sigma)
+            T_t = pose_matrices[t]
+            T_t1 = pose_matrices[t + 1]
+            debug_written = False
+            for offset in CONTACT_OFFSETS:
+                key_t = (T_t @ np.concatenate([offset, [1.0]])).squeeze()[:3]
+                key_t1 = (T_t1 @ np.concatenate([offset, [1.0]])).squeeze()[:3]
+                uv0 = _project_point(intrinsic_t, extrinsic_t, key_t)
+                uv1 = _project_point(intrinsic_t1, extrinsic_t1, key_t1)
+                if uv0 is None or uv1 is None:
+                    continue
+                du = uv1[0] - uv0[0]
+                dv = uv1[1] - uv0[1]
+                _rasterize(flow[t], mask[t], uv0[0], uv0[1], du, dv, width, height, resolution, sigma)
+                if (
+                    debug_viz_dir is not None
+                    and not debug_written
+                    and relative_episode_path is not None
+                ):
+                    _write_debug_flow_visualization(
+                        rgb,
+                        t,
+                        uv0,
+                        uv1,
+                        debug_viz_dir,
+                        relative_episode_path,
+                        arm,
+                        camera,
+                    )
+                    debug_written = True
         output_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "flow": flow,
@@ -172,6 +275,12 @@ def main():
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--compute-video-flow", action="store_true")
     parser.add_argument("--video-flow-resolution", type=int, default=None)
+    parser.add_argument(
+        "--debug-viz-dir",
+        type=Path,
+        default=None,
+        help="Optional directory to dump projected flow overlays for manual inspection.",
+    )
     args = parser.parse_args()
 
     episode_files = sorted(args.dataset_root.rglob("episode*.hdf5"))
@@ -193,6 +302,8 @@ def main():
             args.sigma,
             compute_video_flow=args.compute_video_flow,
             video_flow_resolution=args.video_flow_resolution,
+            debug_viz_dir=args.debug_viz_dir,
+            relative_episode_path=rel,
         )
         if not ok and err:
             print(f"[WARN] {err}")

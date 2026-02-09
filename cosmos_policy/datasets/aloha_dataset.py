@@ -133,6 +133,61 @@ def get_history_indices(curr_step_index: int, num_history_indices: int, spacing_
     return tuple(indices.tolist())
 
 
+_TASK_DIR_SKIP_TOKENS = {
+    "data",
+    "train",
+    "val",
+    "demo",
+    "demos",
+    "rollout",
+    "rollouts",
+    "success",
+    "failure",
+    "failures",
+}
+
+_TASK_NAME_ALIASES = {
+    "fold_shirt": "fold_shirt",
+    "candies_in_bowl": "put_candies_in_bowl",
+    "put_candies_in_bowl": "put_candies_in_bowl",
+    "candy_in_bag": "put_candy_in_bag",
+    "put_candy_in_bag": "put_candy_in_bag",
+    "flatten_shirt": "flatten_shirt",
+    "brown_chicken_wing_on_plate": "put_brown_chicken_wing_on_plate",
+    "put_brown_chicken_wing_on_plate": "put_brown_chicken_wing_on_plate",
+    "purple_eggplant_on_plate": "put_purple_eggplant_on_plate",
+    "put_purple_eggplant_on_plate": "put_purple_eggplant_on_plate",
+}
+
+
+def _infer_command_from_path(file_path: str) -> str:
+    """
+    Infer a task/command name from a dataset file path by walking up the directory tree
+    and skipping generic folder names.
+    """
+
+    parts = Path(file_path).parts
+    command_token: str | None = None
+
+    for idx in range(2, len(parts) + 1):
+        candidate = parts[-idx]
+        candidate_norm = candidate.strip().lower().replace("-", "_")
+        if (
+            candidate_norm == ""
+            or candidate_norm in _TASK_DIR_SKIP_TOKENS
+            or candidate_norm.startswith("episode")
+        ):
+            continue
+        command_token = candidate_norm
+        break
+
+    if command_token is None:
+        raise ValueError(f"Unknown command: could not infer from path {file_path}")
+
+    canonical_token = _TASK_NAME_ALIASES.get(command_token, command_token)
+    return canonical_token.replace("_", " ")
+
+
 class ALOHADataset(Dataset):
     def __init__(
         self,
@@ -311,25 +366,8 @@ class ALOHADataset(Dataset):
                             video_paths["cam_right_wrist"], resize_size=self.final_image_size
                         )  # uint8 RGB
                         episode_num_steps = len(images)
-                # Compute language instruction
-                # NOTE: We just hardcode based on the file path for now. Ideally, the demo files would
-                #       contain the task description as a string that we extract.
-                raw_file_string = file.split("/")[-3]
-                if "fold_shirt" in raw_file_string:
-                    raw_file_string = "fold_shirt"
-                elif "candies_in_bowl" in raw_file_string:
-                    raw_file_string = "put_candies_in_bowl"
-                elif "candy_in_bag" in raw_file_string:
-                    raw_file_string = "put_candy_in_bag"
-                elif "flatten_shirt" in raw_file_string:
-                    raw_file_string = "flatten_shirt"
-                elif "brown_chicken_wing_on_plate" in raw_file_string:
-                    raw_file_string = "put_brown_chicken_wing_on_plate"
-                elif "purple_eggplant_on_plate" in raw_file_string:
-                    raw_file_string = "put_purple_eggplant_on_plate"
-                else:
-                    raise ValueError(f"Unknown command: {raw_file_string}")
-                command = raw_file_string.replace("_", " ")
+                # Compute language instruction by inferring the task name from the file path.
+                command = _infer_command_from_path(file)
                 self.unique_commands.add(command)
                 num_steps = episode_num_steps
                 # Add value function returns if applicable
@@ -548,23 +586,8 @@ class ALOHADataset(Dataset):
                     # Command / task description
                     command = f.attrs.get("task_description", "")
                     if command == "":
-                        # Fallback: derive from folder name like demos
-                        raw_file_string = os.path.basename(os.path.dirname(os.path.dirname(file)))
-                        if "fold_shirt" in raw_file_string:
-                            raw_file_string = "fold_shirt"
-                        elif "candies_in_bowl" in raw_file_string:
-                            raw_file_string = "put_candies_in_bowl"
-                        elif "candy_in_bag" in raw_file_string:
-                            raw_file_string = "put_candy_in_bag"
-                        elif "flatten_shirt" in raw_file_string:
-                            raw_file_string = "flatten_shirt"
-                        elif "brown_chicken_wing_on_plate" in raw_file_string:
-                            raw_file_string = "put_brown_chicken_wing_on_plate"
-                        elif "purple_eggplant_on_plate" in raw_file_string:
-                            raw_file_string = "put_purple_eggplant_on_plate"
-                        else:
-                            raise ValueError(f"Unknown command: {raw_file_string}")
-                        command = raw_file_string.replace("_", " ")
+                        # Fallback: derive from folder structure like demonstration data.
+                        command = _infer_command_from_path(file)
                     self.unique_commands.add(command)
 
                     success = bool(f.attrs.get("success"))

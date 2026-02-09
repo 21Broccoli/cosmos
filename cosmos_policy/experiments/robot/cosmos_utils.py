@@ -16,6 +16,7 @@
 """Utils for evaluating Cosmos policies."""
 
 import json
+import math
 import os
 import pickle
 import queue
@@ -24,7 +25,7 @@ import shutil
 import time
 import traceback
 import uuid
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import requests
@@ -56,6 +57,248 @@ t5_text_embeddings_newly_computed = False  # Global boolean - tracks whether new
 
 # Configure numpy print settings - print to 3 decimals
 np.set_printoptions(formatter={"float": lambda x: "{0:0.3f}".format(x)})
+
+DEFAULT_CONTACT_OFFSETS = np.array(
+    [
+        [0.0, 0.0, 0.0],
+        [0.025, 0.0, 0.0],
+        [-0.025, 0.0, 0.0],
+        [0.0, 0.025, 0.0],
+        [0.0, -0.025, 0.0],
+    ],
+    dtype=np.float32,
+)
+
+
+def _quat_to_matrix(quat: np.ndarray) -> np.ndarray:
+    q = np.asarray(quat, dtype=np.float64)
+    if q.shape[0] != 4:
+        raise ValueError(f"Quaternion must have 4 elements, got {q.shape}")
+    norm = np.linalg.norm(q)
+    if norm < 1e-8:
+        return np.eye(3, dtype=np.float64)
+    q = q / norm
+    x, y, z, w = q  # Dataset convention: (x, y, z, w)
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+    rot = np.array(
+        [
+            [1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy)],
+            [2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx)],
+            [2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy)],
+        ],
+        dtype=np.float64,
+    )
+    return rot
+
+
+def _pose_vec_to_matrix(pose: np.ndarray) -> np.ndarray:
+    pose = np.asarray(pose)
+    if pose.shape[-1] == 7:
+        position = pose[..., :3]
+        quat = pose[..., 3:7]
+        rot = _quat_to_matrix(quat)
+        mat = np.eye(4, dtype=np.float64)
+        mat[:3, :3] = rot
+        mat[:3, 3] = position
+        return mat
+    if pose.shape[-1] == 16:
+        return pose.reshape(4, 4)
+    raise ValueError(f"Unsupported pose representation with shape {pose.shape}.")
+
+
+def _project_point_cv(intrinsic: np.ndarray, extrinsic: np.ndarray, point_world: np.ndarray) -> Optional[Tuple[float, float]]:
+    point_h = np.concatenate([point_world, [1.0]], axis=0)
+    cam = extrinsic @ point_h
+    if cam[2] <= 1e-6:
+        return None
+    pix = intrinsic @ cam[:3]
+    if abs(pix[2]) < 1e-6:
+        return None
+    u = float(pix[0] / pix[2])
+    v = float(pix[1] / pix[2])
+    return u, v
+
+
+def _rasterize_flow_field(
+    flow_tensor: np.ndarray,
+    mask_tensor: np.ndarray,
+    u: float,
+    v: float,
+    du: float,
+    dv: float,
+    image_width: int,
+    image_height: int,
+    latent_hw: Tuple[int, int],
+    sigma: float = 1.25,
+):
+    if not (math.isfinite(u) and math.isfinite(v)):
+        return
+    if image_width <= 1 or image_height <= 1:
+        return
+    latent_h, latent_w = latent_hw
+    if not (0 <= u < image_width and 0 <= v < image_height):
+        return
+    norm_du = du / max(image_width, 1e-6)
+    norm_dv = dv / max(image_height, 1e-6)
+    x = int(np.clip(round(u / (image_width - 1) * (latent_w - 1)), 0, latent_w - 1))
+    y = int(np.clip(round(v / (image_height - 1) * (latent_h - 1)), 0, latent_h - 1))
+    flow_tensor[0, y, x] = norm_du
+    flow_tensor[1, y, x] = norm_dv
+    mask_tensor[0, y, x] = 1.0
+    if sigma <= 0:
+        return
+    radius = max(1, int(round(sigma)))
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            ny = y + dy
+            nx = x + dx
+            if 0 <= ny < latent_h and 0 <= nx < latent_w:
+                weight = math.exp(-0.5 * (dx * dx + dy * dy) / (sigma * sigma))
+                flow_tensor[0, ny, nx] = norm_du * weight
+                flow_tensor[1, ny, nx] = norm_dv * weight
+                mask_tensor[0, ny, nx] = max(mask_tensor[0, ny, nx], weight)
+
+
+def _match_channel_count(tensor: Optional[np.ndarray], target_channels: int) -> Optional[np.ndarray]:
+    if tensor is None or target_channels <= 0:
+        return tensor
+    c, h, w = tensor.shape
+    if c == target_channels:
+        return tensor
+    result = np.zeros((target_channels, h, w), dtype=tensor.dtype)
+    use = min(target_channels, c)
+    result[:use] = tensor[:use]
+    return result
+
+
+def _extract_matrix_from_observation(obs: dict, keys: Tuple[str, ...], expected_shape: Tuple[int, int]) -> Optional[np.ndarray]:
+    for key in keys:
+        value = obs.get(key)
+        if value is None:
+            continue
+        arr = np.asarray(value)
+        if arr.shape == expected_shape:
+            return arr.astype(np.float64)
+        if arr.ndim == 3 and arr.shape[1:] == expected_shape:
+            return arr[0].astype(np.float64)
+    return None
+
+
+def _infer_image_size_from_observation(observation: dict) -> Optional[Tuple[int, int]]:
+    for key in ("primary_image", "image", "rgb"):
+        if key in observation:
+            arr = observation[key]
+            if isinstance(arr, np.ndarray) and arr.ndim >= 2:
+                h, w = arr.shape[:2]
+                return h, w
+    if "image_size" in observation:
+        size = observation["image_size"]
+        if isinstance(size, (tuple, list)) and len(size) >= 2:
+            return int(size[0]), int(size[1])
+    return None
+
+
+def _flow_from_pose_pair(
+    pose_prev: np.ndarray,
+    pose_curr: np.ndarray,
+    intrinsic: np.ndarray,
+    extrinsic: np.ndarray,
+    image_size: Tuple[int, int],
+    latent_hw: Tuple[int, int],
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    if pose_prev is None or pose_curr is None or intrinsic is None or extrinsic is None:
+        return None, None
+    latent_h, latent_w = latent_hw
+    flow = np.zeros((2, latent_h, latent_w), dtype=np.float32)
+    mask = np.zeros((1, latent_h, latent_w), dtype=np.float32)
+    height, width = image_size
+    try:
+        T_prev = _pose_vec_to_matrix(pose_prev)
+        T_curr = _pose_vec_to_matrix(pose_curr)
+    except ValueError:
+        return None, None
+    for offset in DEFAULT_CONTACT_OFFSETS:
+        key_prev = (T_prev @ np.concatenate([offset, [1.0]])).squeeze()[:3]
+        key_curr = (T_curr @ np.concatenate([offset, [1.0]])).squeeze()[:3]
+        uv0 = _project_point_cv(intrinsic, extrinsic, key_prev)
+        uv1 = _project_point_cv(intrinsic, extrinsic, key_curr)
+        if uv0 is None or uv1 is None:
+            continue
+        du = uv1[0] - uv0[0]
+        dv = uv1[1] - uv0[1]
+        _rasterize_flow_field(flow, mask, uv0[0], uv0[1], du, dv, width, height, latent_hw)
+    if mask.max() == 0:
+        return None, None
+    return flow, mask
+
+
+def estimate_action_flow_from_observation(
+    observation: Optional[dict],
+    latent_hw: Tuple[int, int],
+    flow_channels: int,
+    mask_channels: int,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    if observation is None:
+        return None, None
+
+    def _normalize_flow_array(flow_array: Any) -> Optional[np.ndarray]:
+        if flow_array is None:
+            return None
+        arr = np.asarray(flow_array)
+        if arr.ndim == 3 and arr.shape[0] in (2, 4):
+            return arr.astype(np.float32)
+        if arr.ndim == 3 and arr.shape[2] in (2, 4):
+            arr = np.transpose(arr, (2, 0, 1))
+            return arr.astype(np.float32)
+        return None
+
+    direct_flow = _normalize_flow_array(observation.get("action_flow"))
+    direct_mask = _normalize_flow_array(observation.get("action_flow_mask"))
+    if direct_flow is not None:
+        flow = _match_channel_count(direct_flow, flow_channels)
+        mask = _match_channel_count(direct_mask, mask_channels) if direct_mask is not None else None
+        return flow, mask
+
+    flow_path = observation.get("action_flow_path")
+    if flow_path and os.path.exists(flow_path):
+        with np.load(flow_path) as npz:
+            flow = _normalize_flow_array(npz.get("flow"))
+            mask = _normalize_flow_array(npz.get("mask"))
+        flow = _match_channel_count(flow, flow_channels)
+        mask = _match_channel_count(mask, mask_channels) if mask is not None else None
+        return flow, mask
+
+    pose_prev = None
+    for key in ("prev_end_effector_pose", "previous_endpose", "previous_end_effector_pose"):
+        if key in observation:
+            pose_prev = observation[key]
+            break
+    pose_curr = None
+    for key in ("end_effector_pose", "current_endpose", "current_end_effector_pose"):
+        if key in observation:
+            pose_curr = observation[key]
+            break
+    intrinsic = _extract_matrix_from_observation(
+        observation,
+        ("camera_intrinsics", "intrinsic_cv", "head_camera_intrinsics"),
+        (3, 3),
+    )
+    extrinsic = _extract_matrix_from_observation(
+        observation,
+        ("camera_extrinsics", "extrinsic_cv", "head_camera_extrinsics"),
+        (4, 4),
+    )
+    image_size = _infer_image_size_from_observation(observation)
+    if pose_prev is not None and pose_curr is not None and intrinsic is not None and extrinsic is not None and image_size:
+        flow, mask = _flow_from_pose_pair(pose_prev, pose_curr, intrinsic, extrinsic, image_size, latent_hw)
+        flow = _match_channel_count(flow, flow_channels)
+        if mask is not None:
+            mask = _match_channel_count(mask, mask_channels) if mask_channels > 0 else None
+        return flow, mask
+
+    return None, None
 
 
 def get_latent_indices_from_model_config(model):
@@ -1045,23 +1288,35 @@ def get_action(
         placeholder_action_flow_mask = None
         if model.config.use_action_flow and model.config.action_flow_channels > 0:
             latent_h, latent_w = model.get_video_latent_height_width()
-            placeholder_action_flow = torch.zeros(
-                batch_size,
+            flow_np, mask_np = estimate_action_flow_from_observation(
+                observation or {},
+                (latent_h, latent_w),
                 model.config.action_flow_channels,
-                latent_h,
-                latent_w,
-                dtype=torch.bfloat16,
-            ).cuda()
-            mask_channels = (
-                model.config.action_flow_mask_channels if model.config.action_flow_mask_channels > 0 else 1
+                model.config.action_flow_mask_channels if model.config.action_flow_mask_channels > 0 else 0,
             )
-            placeholder_action_flow_mask = torch.ones(
-                batch_size,
-                mask_channels,
-                latent_h,
-                latent_w,
-                dtype=torch.bfloat16,
-            ).cuda()
+            if flow_np is None:
+                flow_np = np.zeros(
+                    (model.config.action_flow_channels, latent_h, latent_w),
+                    dtype=np.float32,
+                )
+            placeholder_action_flow = (
+                torch.from_numpy(flow_np)
+                .to(dtype=torch.bfloat16, device=DEVICE)
+                .unsqueeze(0)
+                .repeat(batch_size, 1, 1, 1)
+            )
+            if model.config.action_flow_mask_channels > 0:
+                if mask_np is None:
+                    mask_np = np.ones(
+                        (model.config.action_flow_mask_channels, latent_h, latent_w),
+                        dtype=np.float32,
+                    )
+                placeholder_action_flow_mask = (
+                    torch.from_numpy(mask_np)
+                    .to(dtype=torch.bfloat16, device=DEVICE)
+                    .unsqueeze(0)
+                    .repeat(batch_size, 1, 1, 1)
+                )
 
         data_batch = {
             "dataset_name": "video_data",

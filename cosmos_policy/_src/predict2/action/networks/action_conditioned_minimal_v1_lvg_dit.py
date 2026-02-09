@@ -103,6 +103,7 @@ class ActionConditionedMinimalV1LVGDiT(MiniTrainDIT):
 
         self.enable_flow_alignment_head = kwargs.pop("enable_flow_alignment_head", False)
         self.flow_alignment_channels = kwargs.pop("flow_alignment_channels", 0)
+        self.flow_context_channels = kwargs.pop("flow_context_channels", self.flow_alignment_channels)
         self.flow_alignment_num_heads = kwargs.pop("flow_alignment_num_heads", kwargs.get("num_heads", 16))
 
         super().__init__(*args, **kwargs)
@@ -130,6 +131,7 @@ class ActionConditionedMinimalV1LVGDiT(MiniTrainDIT):
             )
         else:
             self.flow_alignment_head = None
+        self._set_flow_feature_adapter(self.flow_context_channels)
 
     def forward(
         self,
@@ -193,6 +195,17 @@ class ActionConditionedMinimalV1LVGDiT(MiniTrainDIT):
             and action_latent_indices is not None
         ):
             x_B_T_H_W_D = self._apply_flow_alignment(
+                x_B_T_H_W_D,
+                action_flow_context_B_C_H_W,
+                action_flow_mask_context_B_C_H_W,
+                action_latent_indices,
+            )
+        if (
+            self.flow_feature_adapter is not None
+            and action_flow_context_B_C_H_W is not None
+            and action_latent_indices is not None
+        ):
+            x_B_T_H_W_D = self._inject_flow_features(
                 x_B_T_H_W_D,
                 action_flow_context_B_C_H_W,
                 action_flow_mask_context_B_C_H_W,
@@ -271,6 +284,30 @@ class ActionConditionedMinimalV1LVGDiT(MiniTrainDIT):
         x_B_T_H_W_D[batch_indices, action_latent_indices, :, :, :] = action_tokens + aligned
         return x_B_T_H_W_D
 
+    def _inject_flow_features(
+        self,
+        x_B_T_H_W_D: torch.Tensor,
+        flow_context: torch.Tensor,
+        flow_mask: Optional[torch.Tensor],
+        action_latent_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.flow_feature_adapter is None:
+            return x_B_T_H_W_D
+        batch_indices = torch.arange(x_B_T_H_W_D.shape[0], device=x_B_T_H_W_D.device)
+        target_hw = (x_B_T_H_W_D.shape[2], x_B_T_H_W_D.shape[3])
+        flow = flow_context.to(device=x_B_T_H_W_D.device, dtype=x_B_T_H_W_D.dtype)
+        flow = self._resize_flow_tensor(flow, target_hw, mode="bilinear")
+        if flow_mask is not None:
+            mask = self._resize_flow_tensor(flow_mask, target_hw, mode="nearest")
+            flow = flow * mask
+        flow_emb = self.flow_feature_adapter(flow)
+        flow_emb = flow_emb.permute(0, 2, 3, 1)  # (B, H, W, D)
+        gate = torch.tanh(self.flow_injection_gate) if self.flow_injection_gate is not None else 1.0
+        x_B_T_H_W_D[batch_indices, action_latent_indices, :, :, :] = (
+            x_B_T_H_W_D[batch_indices, action_latent_indices, :, :, :] + gate * flow_emb
+        )
+        return x_B_T_H_W_D
+
     @staticmethod
     def _resize_flow_tensor(tensor: torch.Tensor, target_hw: Tuple[int, int], mode: str) -> torch.Tensor:
         if tensor.dim() == 3:
@@ -291,6 +328,20 @@ class ActionConditionedMinimalV1LVGDiT(MiniTrainDIT):
             )
         else:
             self.flow_alignment_head = None
+        self._set_flow_feature_adapter(channels if channels > 0 else 0)
+
+    def _set_flow_feature_adapter(self, context_channels: int):
+        self.flow_context_channels = context_channels
+        if context_channels > 0:
+            self.flow_feature_adapter = nn.Sequential(
+                nn.Conv2d(context_channels, self.model_channels, kernel_size=3, padding=1),
+                nn.SiLU(),
+                nn.Conv2d(self.model_channels, self.model_channels, kernel_size=1),
+            )
+            self.flow_injection_gate = nn.Parameter(torch.zeros(1))
+        else:
+            self.flow_feature_adapter = None
+            self.flow_injection_gate = None
 
 
 class ActionChunkConditionedMinimalV1LVGDiT(MiniTrainDIT):

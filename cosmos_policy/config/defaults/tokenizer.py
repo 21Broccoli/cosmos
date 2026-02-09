@@ -17,14 +17,25 @@
 Cosmos Policy tokenizer registration with deterministic seeding support.
 """
 
+import os
+
 from hydra.core.config_store import ConfigStore
 
 from cosmos_policy._src.imaginaire.lazy_config import LazyCall as L
 from cosmos_policy.tokenizers.wan2pt1 import Wan2pt1VAEInterface
 
 # Policy-specific wan2pt1 tokenizer with deterministic seeding
+_DEFAULT_TOKENIZER_PATH = "hf://nvidia/Cosmos-Predict2-2B-Video2World/tokenizer/tokenizer.pth"
+_TOKENIZER_ROOT_OVERRIDE = os.environ.get("COSMOS_VIDEO2WORLD_TOKENIZER_ROOT")
+_TOKENIZER_FILE_OVERRIDE = os.environ.get("COSMOS_VIDEO2WORLD_TOKENIZER")
+if _TOKENIZER_ROOT_OVERRIDE:
+    candidate_path = os.path.join(_TOKENIZER_ROOT_OVERRIDE, "tokenizer", "tokenizer.pth")
+    if os.path.exists(candidate_path):
+        _DEFAULT_TOKENIZER_PATH = candidate_path
+elif _TOKENIZER_FILE_OVERRIDE:
+    _DEFAULT_TOKENIZER_PATH = _TOKENIZER_FILE_OVERRIDE
 PolicyWan2pt1VAEConfig = L(Wan2pt1VAEInterface)(
-    vae_pth="hf://nvidia/Cosmos-Predict2-2B-Video2World/tokenizer/tokenizer.pth",
+    vae_pth=os.environ.get("COSMOS_VIDEO2WORLD_TOKENIZER", _DEFAULT_TOKENIZER_PATH),
     s3_credential_path="credentials/s3_training.secret",
     load_mean_std=False,
     temporal_window=4,

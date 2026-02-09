@@ -336,6 +336,9 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
                     in_channels=self.config.action_flow_channels,
                     hidden_dim=self.net.model_channels if hasattr(self, "net") else self.config.state_ch * 8,
                 )
+            # Ensure the decoder follows the same device/optimizer lifecycle as the diffusion backbone.
+            if hasattr(self, "net"):
+                self.net.add_module("action_flow_decoder", self.flow_decoder)
 
     def training_step(
         self, data_batch: dict[str, torch.Tensor], iteration: int
@@ -563,6 +566,8 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
             and video_flow_gt is not None
         ):
             video_flow_latent = _resize_spatial_tensor(video_flow_gt, channels_limit=action_flow_info.flow_channels)
+            if video_flow_latent is not None:
+                video_flow_latent = video_flow_latent.detach()
             mask_tensor = action_flow_info.mask_latent
             if mask_tensor is None and video_flow_mask is not None:
                 mask_tensor = _resize_spatial_tensor(video_flow_mask, channels_limit=None, mode="nearest")

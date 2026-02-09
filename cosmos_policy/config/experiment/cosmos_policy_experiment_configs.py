@@ -35,6 +35,16 @@ val_sampling_size_override = dict(
     video_width=1280,
 )
 BASE_DATASETS_DIR = os.environ.get("BASE_DATASETS_DIR", ".")
+_ALOHA_DEFAULT_DATA_DIR = os.path.join(BASE_DATASETS_DIR, "ALOHA-Cosmos-Policy", "preprocessed")
+ALOHA_DATA_DIR = os.environ.get("ALOHA_DATA_DIR", os.environ.get("ALOHA_MIXTURE_DIR", _ALOHA_DEFAULT_DATA_DIR))
+ALOHA_T5_EMB_PATH = os.environ.get("ALOHA_T5_EMB", os.path.join(ALOHA_DATA_DIR, "t5_embeddings.pkl"))
+
+
+def _resolve_video2world_ckpt(default_uri: str) -> str:
+    override = os.environ.get("COSMOS_VIDEO2WORLD_CKPT", "").strip()
+    if override:
+        return override
+    return get_checkpoint_path(default_uri)
 
 
 # *** Main checkpoint ***
@@ -145,7 +155,7 @@ cosmos_predict2_2b_480p_libero = LazyDict(
             context_parallel_size=1,
         ),
         checkpoint=dict(
-            load_path=get_checkpoint_path("hf://nvidia/Cosmos-Predict2-2B-Video2World/model-480p-16fps.pt"),
+            load_path=_resolve_video2world_ckpt("hf://nvidia/Cosmos-Predict2-2B-Video2World/model-480p-16fps.pt"),
             load_training_state=False,  # This means do not load train state from the base checkpoint above (load_path); but when resuming this job, will load train state
             strict_resume=False,
             save_iter=1000,
@@ -287,8 +297,8 @@ cosmos_predict2_2b_480p_robocasa_50_demos_per_task__inference = LazyDict(
 
 # *** Main checkpoint ***
 aloha_cosmos_policy_dataset_185_demos = L(ALOHADataset)(
-    data_dir=os.path.join(BASE_DATASETS_DIR, "ALOHA-Cosmos-Policy", "preprocessed"),
-    t5_text_embeddings_path=os.path.join(BASE_DATASETS_DIR, "ALOHA-Cosmos-Policy", "preprocessed", "t5_embeddings.pkl"),
+    data_dir=ALOHA_DATA_DIR,
+    t5_text_embeddings_path=ALOHA_T5_EMB_PATH,
     chunk_size=50,
     use_image_aug=True,
     use_stronger_image_aug=True,
@@ -389,8 +399,8 @@ cosmos_predict2_2b_480p_aloha_185_demos_4_tasks_mixture_foldshirt15_candiesinbow
 aloha_2025_09_18__648_rollouts__cosmos_policy__pi05__pi0__openvla_oft__diffusion_policy__dataset = L(
     ALOHADataset
 )(
-    data_dir=os.path.join(BASE_DATASETS_DIR, "ALOHA-Cosmos-Policy", "preprocessed"),
-    t5_text_embeddings_path=os.path.join(BASE_DATASETS_DIR, "ALOHA-Cosmos-Policy", "preprocessed", "t5_embeddings.pkl"),
+    data_dir=ALOHA_DATA_DIR,
+    t5_text_embeddings_path=ALOHA_T5_EMB_PATH,
     chunk_size=50,
     use_image_aug=True,
     use_stronger_image_aug=True,
