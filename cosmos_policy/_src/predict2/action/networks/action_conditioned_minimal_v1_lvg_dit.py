@@ -24,6 +24,7 @@ from einops import rearrange
 from cosmos_policy._src.imaginaire.utils import log
 from cosmos_policy._src.predict2.conditioner import DataType
 from cosmos_policy._src.predict2.networks.minimal_v4_dit import MiniTrainDIT
+from cosmos_policy.modules.flow_alignment_head import FlowAlignmentHead, FlowAlignmentState
 
 
 class Mlp(nn.Module):
@@ -43,44 +44,6 @@ class Mlp(nn.Module):
         x = self.fc2(x)
         x = self.drop(x)
         return x
-
-
-class FlowAlignmentHead(nn.Module):
-    def __init__(self, flow_channels: int, hidden_dim: int, num_heads: int):
-        super().__init__()
-        self.proj = nn.Sequential(
-            nn.Conv2d(flow_channels, hidden_dim, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1),
-        )
-        self.query_norm = nn.LayerNorm(hidden_dim)
-        self.key_norm = nn.LayerNorm(hidden_dim)
-        self.attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
-        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.gate = nn.Parameter(torch.zeros(1))
-
-    def forward(
-        self,
-        action_tokens_B_H_W_D: torch.Tensor,
-        flow_B_C_H_W: torch.Tensor,
-        mask_B_C_H_W: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        B, H, W, D = action_tokens_B_H_W_D.shape
-        query = self.query_norm(action_tokens_B_H_W_D.view(B, H * W, D))
-        key_tokens = self.proj(flow_B_C_H_W).view(B, D, H * W).transpose(1, 2)
-        key_tokens = self.key_norm(key_tokens)
-        key_padding_mask = None
-        if mask_B_C_H_W is not None:
-            resized_mask = mask_B_C_H_W
-            if resized_mask.dim() == 3:
-                resized_mask = resized_mask.unsqueeze(1)
-            resized_mask = resized_mask.mean(dim=1, keepdim=True)
-            resized_mask = resized_mask.view(B, 1, H * W)
-            key_padding_mask = resized_mask.squeeze(1) <= 0.0
-        attn_out, _ = self.attn(query, key_tokens, key_tokens, key_padding_mask=key_padding_mask)
-        attn_out = self.out_proj(attn_out)
-        attn_out = attn_out.view(B, H, W, D)
-        return torch.tanh(self.gate) * attn_out
 
 
 class ActionConditionedMinimalV1LVGDiT(MiniTrainDIT):
@@ -105,6 +68,10 @@ class ActionConditionedMinimalV1LVGDiT(MiniTrainDIT):
         self.flow_alignment_channels = kwargs.pop("flow_alignment_channels", 0)
         self.flow_context_channels = kwargs.pop("flow_context_channels", self.flow_alignment_channels)
         self.flow_alignment_num_heads = kwargs.pop("flow_alignment_num_heads", kwargs.get("num_heads", 16))
+        self.flow_alignment_geom_channels = kwargs.pop(
+            "flow_alignment_geom_channels",
+            max(2, self.flow_alignment_channels),
+        )
 
         super().__init__(*args, **kwargs)
 
@@ -125,12 +92,13 @@ class ActionConditionedMinimalV1LVGDiT(MiniTrainDIT):
         )
         if self.enable_flow_alignment_head and self.flow_alignment_channels > 0:
             self.flow_alignment_head = FlowAlignmentHead(
-                flow_channels=self.flow_alignment_channels,
                 hidden_dim=self.model_channels,
-                num_heads=self.flow_alignment_num_heads,
+                geom_channels=max(1, self.flow_alignment_geom_channels),
+                flow_context_channels=self.flow_alignment_channels,
             )
         else:
             self.flow_alignment_head = None
+        self.flow_alignment_state: Optional[FlowAlignmentState] = None
         self._set_flow_feature_adapter(self.flow_context_channels)
 
     def forward(
@@ -151,6 +119,7 @@ class ActionConditionedMinimalV1LVGDiT(MiniTrainDIT):
         **kwargs,
     ) -> torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
         del kwargs
+        self.flow_alignment_state = None
 
         if data_type == DataType.VIDEO:
             x_B_C_T_H_W = torch.cat([x_B_C_T_H_W, condition_video_input_mask_B_C_T_H_W.type_as(x_B_C_T_H_W)], dim=1)
@@ -272,16 +241,19 @@ class ActionConditionedMinimalV1LVGDiT(MiniTrainDIT):
         action_latent_indices: torch.Tensor,
     ) -> torch.Tensor:
         batch_indices = torch.arange(x_B_T_H_W_D.shape[0], device=x_B_T_H_W_D.device)
-        action_latent_indices = action_latent_indices.to(dtype=torch.long, device=x_B_T_H_W_D.device)
-        action_tokens = x_B_T_H_W_D[batch_indices, action_latent_indices]  # (B, H, W, D)
         flow = flow_context.to(device=x_B_T_H_W_D.device, dtype=x_B_T_H_W_D.dtype)
+        if self.flow_alignment_channels > 0 and flow.shape[1] > self.flow_alignment_channels:
+            flow = flow[:, : self.flow_alignment_channels, :, :]
         mask = flow_mask.to(device=x_B_T_H_W_D.device, dtype=x_B_T_H_W_D.dtype) if flow_mask is not None else None
-        target_hw = (action_tokens.shape[1], action_tokens.shape[2])
-        flow = self._resize_flow_tensor(flow, target_hw, mode="bilinear")
-        if mask is not None:
-            mask = self._resize_flow_tensor(mask, target_hw, mode="nearest")
-        aligned = self.flow_alignment_head(action_tokens, flow, mask)
-        x_B_T_H_W_D[batch_indices, action_latent_indices, :, :, :] = action_tokens + aligned
+        bias, state = self.flow_alignment_head(
+            video_latents_B_T_H_W_D=x_B_T_H_W_D,
+            action_latent_indices=action_latent_indices,
+            flow_context_B_C_H_W=flow,
+            flow_mask_B_C_H_W=mask,
+        )
+        action_tokens = x_B_T_H_W_D[batch_indices, action_latent_indices, :, :, :]
+        x_B_T_H_W_D[batch_indices, action_latent_indices, :, :, :] = action_tokens + bias
+        self.flow_alignment_state = state
         return x_B_T_H_W_D
 
     def _inject_flow_features(
@@ -316,15 +288,23 @@ class ActionConditionedMinimalV1LVGDiT(MiniTrainDIT):
             tensor = F.interpolate(tensor, size=target_hw, mode=mode, align_corners=False if mode == "bilinear" else None)
         return tensor
 
-    def configure_flow_alignment(self, enabled: bool, channels: int, num_heads: int):
+    def configure_flow_alignment(
+        self,
+        enabled: bool,
+        channels: int,
+        num_heads: int,
+        geom_channels: Optional[int] = None,
+    ):
         self.enable_flow_alignment_head = enabled
         self.flow_alignment_channels = channels
         self.flow_alignment_num_heads = num_heads
-        if enabled and channels > 0:
+        if geom_channels is not None:
+            self.flow_alignment_geom_channels = geom_channels
+        if enabled and (channels > 0 or self.flow_alignment_geom_channels > 0):
             self.flow_alignment_head = FlowAlignmentHead(
-                flow_channels=channels,
                 hidden_dim=self.model_channels,
-                num_heads=num_heads,
+                geom_channels=max(1, self.flow_alignment_geom_channels),
+                flow_context_channels=max(0, channels),
             )
         else:
             self.flow_alignment_head = None

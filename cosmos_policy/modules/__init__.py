@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from .action_flow_decoder import ActionFlowDecoder
+from .flow_alignment_head import FlowAlignmentHead, FlowAlignmentState
 from .flow_matching import compute_flow_matching_loss
 
-__all__ = ["ActionFlowDecoder", "compute_flow_matching_loss"]
+__all__ = ["ActionFlowDecoder", "compute_flow_matching_loss", "FlowAlignmentHead", "FlowAlignmentState"]

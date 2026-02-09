@@ -283,10 +283,12 @@ class CosmosPolicyModelConfig(BaseText2WorldModelConfig):
     action_flow_mask_channels: int = 0
     enable_flow_alignment_head: bool = False
     flow_alignment_num_heads: int = 4
+    flow_alignment_geom_channels: int = 0
     flow_matching_loss_weight: float = 0.0
     flow_matching_loss_type: str = "l2"
     decode_actions_from_flow: bool = False
     flow_action_loss_weight: float = 0.0
+    flow_alignment_loss_weight: float = 0.0
     flow_decoder: Optional[LazyDict] = None
 
     def __attrs_post_init__(self):
@@ -318,10 +320,16 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
         self.sde = lazy_instantiate(config.sde)
         self.sampler = CosmosPolicySampler()
         if hasattr(self.net, "configure_flow_alignment"):
+            geom_channels = (
+                self.config.flow_alignment_geom_channels
+                if self.config.flow_alignment_geom_channels > 0
+                else self.config.action_flow_channels
+            )
             self.net.configure_flow_alignment(
                 enabled=self.config.enable_flow_alignment_head,
                 channels=self.config.action_flow_channels,
                 num_heads=self.config.flow_alignment_num_heads,
+                geom_channels=geom_channels,
             )
         self.flow_decoder: Optional[ActionFlowDecoder] = None
         if self.config.use_action_flow and (
@@ -557,20 +565,30 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
         # loss weights for different noise levels
         weights_per_sigma_B_T = self.get_per_sigma_loss_weights(sigma=sigma_B_T)
 
+        video_flow_latent_full = (
+            _resize_spatial_tensor(video_flow_gt, channels_limit=None) if video_flow_gt is not None else None
+        )
+        video_flow_mask_latent = (
+            _resize_spatial_tensor(video_flow_mask, channels_limit=None, mode="nearest")
+            if video_flow_mask is not None
+            else None
+        )
+
         flow_matching_loss = None
         flow_action_loss = None
+        flow_alignment_loss = None
         if (
             self.config.flow_matching_loss_weight > 0
             and self.config.use_action_flow
             and action_flow_info.flow_channels > 0
-            and video_flow_gt is not None
+            and video_flow_latent_full is not None
         ):
-            video_flow_latent = _resize_spatial_tensor(video_flow_gt, channels_limit=action_flow_info.flow_channels)
+            video_flow_latent = video_flow_latent_full[:, : action_flow_info.flow_channels, :, :]
             if video_flow_latent is not None:
                 video_flow_latent = video_flow_latent.detach()
             mask_tensor = action_flow_info.mask_latent
-            if mask_tensor is None and video_flow_mask is not None:
-                mask_tensor = _resize_spatial_tensor(video_flow_mask, channels_limit=None, mode="nearest")
+            if mask_tensor is None and video_flow_mask_latent is not None:
+                mask_tensor = video_flow_mask_latent
             action_indices_clamped = torch.clamp(action_indices, 0, x0_B_C_T_H_W.shape[2] - 1)
             pred_flow = model_pred.x0[
                 batch_indices,
@@ -612,6 +630,29 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
             )
             flow_action_loss = F.mse_loss(flow_action_pred, action_chunk.to(flow_action_pred.dtype))
             kendall_loss = kendall_loss + self.config.flow_action_loss_weight * flow_action_loss
+
+        flow_alignment_state = getattr(self.net, "flow_alignment_state", None)
+        if (
+            self.config.enable_flow_alignment_head
+            and self.config.flow_alignment_loss_weight > 0
+            and flow_alignment_state is not None
+            and video_flow_latent_full is not None
+        ):
+            geom_pred = flow_alignment_state.geom_params_B_H_W_C
+            target_channels = min(geom_pred.shape[-1], video_flow_latent_full.shape[1])
+            if target_channels > 0:
+                geom_pred_ch = rearrange(geom_pred[..., :target_channels], "b h w c -> b c h w")
+                geom_target = video_flow_latent_full[:, :target_channels, :, :].detach()
+                mask_tensor = flow_alignment_state.resized_mask_B_1_H_W
+                if mask_tensor is None and video_flow_mask_latent is not None:
+                    mask_tensor = video_flow_mask_latent[:, :1, :, :]
+                flow_alignment_loss = compute_flow_matching_loss(
+                    geom_target,
+                    geom_pred_ch,
+                    mask=mask_tensor,
+                    loss_type=self.config.flow_matching_loss_type,
+                )
+                kendall_loss = kendall_loss + self.config.flow_alignment_loss_weight * flow_alignment_loss
 
         # Construct mask to support masking out loss (or scaling it by some multiplier) for different types of predictions
         B, T = x0_B_C_T_H_W.shape[0], x0_B_C_T_H_W.shape[2]
@@ -887,6 +928,12 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
                 else torch.zeros(1, device=x0_B_C_T_H_W.device, dtype=x0_B_C_T_H_W.dtype)
             ),
             "flow_action_weight": self.config.flow_action_loss_weight,
+            "flow_alignment_loss": (
+                flow_alignment_loss.detach()
+                if flow_alignment_loss is not None
+                else torch.zeros(1, device=x0_B_C_T_H_W.device, dtype=x0_B_C_T_H_W.dtype)
+            ),
+            "flow_alignment_weight": self.config.flow_alignment_loss_weight,
             "action_flow_channels": action_flow_info.flow_channels,
             # Demo sample losses
             "demo_sample_action_mse_loss": demo_sample_action_mse_loss,  # Main action loss for policy
